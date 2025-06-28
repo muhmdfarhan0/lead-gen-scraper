@@ -3,6 +3,7 @@ import pandas as pd
 import os
 from dotenv import load_dotenv
 from apify_client import ApifyClient
+import re
 
 # Load environment variables
 load_dotenv()
@@ -20,13 +21,13 @@ os.makedirs("results", exist_ok=True)
 # --- Phase 1: Scrape Meta Ads ---
 def scrape_meta_ads(keyword, country, max_results=50):
     search_url = (
-        f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country={country}"
+        f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country={country}"
         f"&q={keyword}&search_type=keyword_unordered&media_type=all"
     )
     run_input = {
         "urls": [{"url": search_url}],
         "count": max_results,
-        "scrapePageAds.activeStatus": "all"
+        "scrapePageAds.activeStatus": "active"
     }
     try:
         run = client.actor("curious_coder/facebook-ads-library-scraper").call(run_input=run_input)
@@ -34,49 +35,49 @@ def scrape_meta_ads(keyword, country, max_results=50):
         if not dataset_id:
             st.error("No dataset ID returned from Apify actor.")
             return pd.DataFrame()
-        
+
         items = list(client.dataset(dataset_id).iterate_items())
     except Exception as e:
         st.error(f"Failed to scrape Meta ads: {e}")
         return pd.DataFrame()
 
-    clean = []
     seen = set()
+    clean = []
+
     for ad in items:
-        try:
-            # Get page name
-            page = ad.get("pageName") or ad.get("page_name")
-            if not page or page in seen:
-                continue
-            seen.add(page)
+        page = ad.get("pageName") or ad.get("page_name")
+        url = ad.get("pageUrl")
+        if not url and page:
+            url = f"https://www.facebook.com/{page.replace(' ', '')}"
 
-            # Safely extract ad text
-            ad_text = ad.get("adText", "")
-            if not ad_text:
-                snapshot = ad.get("snapshot", {})
-                if isinstance(snapshot, dict):
-                    body = snapshot.get("body", {})
-                    if isinstance(body, dict):
-                        ad_text = body.get("text", "").strip()
-                    else:
-                        st.warning(f"Invalid 'body' type for page {page}: {type(body)}")
-                else:
-                    st.warning(f"Invalid 'snapshot' type for page {page}: {type(snapshot)}")
+        ad_text = ad.get("adText", "")
+        if not ad_text:
+            snapshot = ad.get("snapshot") or {}
+            body = snapshot.get("body") or {}
+            ad_text = body.get("text", "")
 
+        ad_text = (ad_text or "").strip()
+
+        if (
+            not page or
+            not ad_text or
+            len(ad_text) < 20 or
+            "{{" in ad_text or
+            re.match(r"^[\W_]+$", ad_text)
+        ):
+            continue
+
+        if page not in seen:
             clean.append({
                 "page_name": page,
-                "page_url": f"https://facebook.com/{page.replace(' ', '')}",
+                "page_url": url,
                 "ad_text": ad_text
             })
-        except Exception as e:
-            st.warning(f"Failed to process ad for page {page}: {e}")
-            continue
+            seen.add(page)
 
     df = pd.DataFrame(clean)
     if not df.empty:
         df.to_csv("results/ads_cleaned.csv", index=False)
-    else:
-        st.warning("No ads were successfully scraped.")
     return df
 
 # --- Phase 2: Enrich Facebook Pages ---
@@ -84,51 +85,49 @@ def enrich_facebook_pages(df):
     enriched = []
     seen = set()
     for _, row in df.iterrows():
-        page = row.get("page_name", "").strip()
-        if not page or page in seen:
+        page_url = row.get("page_url", "").strip()
+        if not page_url or page_url in seen:
             continue
-        seen.add(page)
+        seen.add(page_url)
 
-        fb_url = f"https://www.facebook.com/{page.replace(' ', '')}"
         try:
-            run = client.actor("apify/facebook-page-scraper").call(
-                run_input={"startUrls": [{"url": fb_url}], "scrapeAbout": True}
+            run = client.actor("apify/facebook-pages-scraper").call(
+                run_input={
+                    "startUrls": [{"url": page_url, "method": "GET"}],
+                    "scrapePosts": False,
+                    "scrapeReviews": False,
+                    "scrapeAbout": True
+                }
             )
-            did = run.get("defaultDatasetId")
-            result = list(client.dataset(did).iterate_items())
-            if result:
-                data = result[0]
+            dataset_id = run.get("defaultDatasetId")
+            if not dataset_id:
+                continue
+            items = list(client.dataset(dataset_id).iterate_items())
+            if items:
+                data = items[0]
                 enriched.append({
-                    "page_name": page,
-                    "page_url": fb_url,
-                    "website": data.get("website", ""),
-                    "email": data.get("email", ""),
+                    **row,
                     "phone": data.get("phone", ""),
-                    "category": data.get("category", ""),
-                    "bio": data.get("bio", ""),
-                    "address": data.get("address", "")
+                    "email": data.get("email", ""),
+                    "website": data.get("website", "")
                 })
         except Exception as e:
-            st.warning(f"Failed to scrape {fb_url}: {e}")
+            st.warning(f"Failed to enrich {page_url}: {e}")
 
     enriched_df = pd.DataFrame(enriched)
     if not enriched_df.empty:
         enriched_df.to_csv("results/enriched_pages.csv", index=False)
-    else:
-        st.warning("No pages were successfully enriched.")
     return enriched_df
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Lead Gen Scraper", layout="centered")
 st.title("📊 Lead Generation Automation Tool")
 
-# Input fields for both phases
 st.header("🔍 Scraper Settings")
 keyword = st.text_input("Enter keyword", "marketing")
 country = st.text_input("2-letter country code", "US")
 max_ads = st.slider("Number of ads to fetch", 10, 100, 50)
 
-# Full Pipeline Button
 st.header("🚀 Run Full Pipeline")
 if st.button("▶️ Run Full Pipeline"):
     with st.spinner("Running Phase 1: Scraping Meta Ads..."):
@@ -146,7 +145,6 @@ if st.button("▶️ Run Full Pipeline"):
         st.dataframe(enriched_df)
         st.download_button("⬇️ Download enriched_pages.csv", enriched_df.to_csv(index=False), file_name="enriched_pages.csv")
 
-# Individual Phase Controls
 st.header("🔍 Phase 1: Scrape Meta Ads")
 if st.button("▶️ Run Meta Ads Scraper"):
     with st.spinner("Scraping Meta Ads..."):
